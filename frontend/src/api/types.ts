@@ -399,6 +399,8 @@ export interface AdminDisputeListItem {
   clientWalletAddress: string;
   /** UTC epoch seconds -- `null` only for a pre-3.4 booking with no slot. */
   slotStartsAt: number | null;
+  /** UTC epoch seconds -- `null` only when no opening record exists. */
+  openedAt: number | null;
   /** Story 3.6 (review round): `"resolve"` while an admin's resolve is
    * already awaiting chain confirmation for this booking -- the admin UI
    * hides/disables the row rather than let a second resolve be built. */
