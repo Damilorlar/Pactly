@@ -103,7 +103,6 @@ import { recordEscrowDisputeResolution } from "../db/escrowDisputeResolutions.js
 import { listContractDeployments, recordContractDeployment } from "../db/escrowContractDeployments.js";
 import { escrowDisputeOpenings, bookings } from "../db/schema.js";
 import { getEscrowDisputeOpening, getEscrowDisputeOpeningsForBookings, recordEscrowDisputeOpening } from "../db/escrowDisputeOpenings.js";
-import { listContractDeployments } from "../db/escrowContractDeployments.js";
 import { getProviderProfileById, getProviderProfileByWallet } from "../db/providerProfiles.js";
 import { getReviewByBookingId, getReviewsForBookings, toReviewView, type ReviewView } from "../db/reviews.js";
 import { computeDepositAmount, NotAProviderError, ProviderNotFoundError } from "./profile.js";

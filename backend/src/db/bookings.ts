@@ -390,68 +390,6 @@ export function updateEscrowStateSync(db: DbOrTx, id: string, escrowState: Escro
   }
 }
 
-/** Issue #2: records that a verified session was counted for this booking.
- * Sets `verified_session_counted_at` (guarded on null so a replay can never
- * count twice) and increments the provider's `verified_session_count`.
- * Throws if `id` matches no row. */
-export function recordVerifiedSessionCountedSync(
-  db: DbOrTx,
-  id: string,
-  providerProfileId: string,
-  now: number,
-): void {
-  const bookingResult = db
-    .update(bookings)
-    .set({ verifiedSessionCountedAt: now })
-    .where(and(eq(bookings.id, id), isNull(bookings.verifiedSessionCountedAt)))
-    .run();
-  if (bookingResult.changes === 0) {
-    throw new TypeError(`No booking exists with id "${id}"`);
-  }
-  db.update(providerProfiles)
-    .set({ verifiedSessionCount: sql`${providerProfiles.verifiedSessionCount} + 1` })
-    .where(eq(providerProfiles.id, providerProfileId))
-    .run();
-}
-
-/** Story: Mark client arrived -- sets `arrived_at` on a locked booking.
- * Guards on `arrived_at` being null so the first timestamp wins. Throws if
- * `id` matches no row. */
-export function markBookingArrived(db: DbOrTx, id: string, now: number): void {
-  const result = db
-    .update(bookings)
-    .set({ arrivedAt: now })
-    .where(and(eq(bookings.id, id), isNull(bookings.arrivedAt)))
-    .run();
-  if (result.changes === 0) {
-    throw new TypeError(`No booking exists with id "${id}"`);
-  }
-}
-
-/** Story: records that a provider-cancellation was counted for this booking.
- * Sets `provider_cancellation_counted_at` (guarded on null so a replay never
- * counts twice) and increments the provider's `provider_cancellation_count`.
- * Throws if `id` matches no row. */
-export function recordProviderCancellationCountedSync(
-  db: DbOrTx,
-  id: string,
-  providerProfileId: string,
-  now: number,
-): void {
-  const result = db
-    .update(bookings)
-    .set({ providerCancellationCountedAt: now })
-    .where(and(eq(bookings.id, id), isNull(bookings.providerCancellationCountedAt)))
-    .run();
-  if (result.changes === 0) {
-    throw new TypeError(`No booking exists with id "${id}"`);
-  }
-  db.update(providerProfiles)
-    .set({ providerCancellationCount: sql`${providerProfiles.providerCancellationCount} + 1` })
-    .where(eq(providerProfiles.id, providerProfileId))
-    .run();
-}
-
 /** The event worker's own write path. Touches `escrowState` alone -- never
  * `balanceState`, which is a different owner's column (AD-3). */
 export async function updateEscrowState(db: Db, id: string, escrowState: EscrowState): Promise<void> {
