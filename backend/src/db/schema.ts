@@ -915,3 +915,16 @@ export const escrowContractDeployments = sqliteTable(
 );
 
 export type EscrowContractDeploymentRow = typeof escrowContractDeployments.$inferSelect;
+
+/**
+ * Issue #31: one in-app event row per party per booking-level action (lock,
+ * release, dispute, resolve). Read by `db/escrowEvents.ts`, scoped to one
+ * `walletAddress` at a time -- a party never sees the other party's rows.
+ */
+export const escrowEvents = sqliteTable("escrow_events", {
+  id: text("id").primaryKey(),
+  bookingId: text("booking_id").notNull(),
+  walletAddress: text("wallet_address").notNull(),
+  type: text("type", { enum: ["lock", "release", "dispute", "resolve"] }).notNull(),
+  createdAt: integer("created_at").notNull(),
+});
