@@ -1584,6 +1584,14 @@ export interface AdminDisputeListItem {
   provider: BookingProviderSummary;
   clientWalletAddress: string;
   slotStartsAt: number | null;
+  /** UTC epoch seconds -- `null` only when no opening record exists. */
+  openedAt: number | null;
+  /** Free-text note the opener attached (may be empty, max 500 chars,
+   * leading/trailing spaces trimmed before count). */
+  note?: string;
+  /** SHA-256 hex evidence hash the opener attached (64 lowercase hex chars,
+   * displayed as plain text, not a clickable link). */
+  evidenceHash?: string;
   /** Story 3.6 (review round): `"resolve"` while an admin's resolve is
    * already awaiting chain confirmation for this booking -- the admin UI
    * hides/disables the row rather than let a second resolve be built. */
@@ -1648,7 +1656,7 @@ export async function listOpenDisputes(db: Db): Promise<AdminDisputeListItem[]> 
       slotStartsAt: slot?.startsAt ?? null,
       openedAt: matchesCurrentContract ? opening.openedAt : null,
       note: matchesCurrentContract ? (opening.note ?? undefined) : undefined,
-      evidenceHash: matchesCurrentContract ? opening.evidenceHash : undefined,
+      evidenceHash: matchesCurrentContract ? (opening.evidenceHash ?? undefined) : undefined,
       pendingAction: derivePendingAction(booking, "disputed"),
     };
   });

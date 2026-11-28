@@ -848,7 +848,16 @@ test("listOpenDisputes returns only bookings whose current lifecycle action is s
       startDispute: async () => ({ unsignedXdr: "x", txHash: openOneTx.hash }),
       submit: async () => ({ txHash: "relayed" }),
     };
-    await openDispute(result.db, openOne.bookingId, openOne.providerWalletAddress, "client-no-show", openOneAdapter);
+    await openDispute(
+      result.db,
+      openOne.bookingId,
+      openOne.providerWalletAddress,
+      "client-no-show",
+      openOneAdapter,
+      Math.floor(Date.now() / 1000),
+      "Client never showed up",
+      "a".repeat(64),
+    );
     // Review round: the opening row is only ever written once a matching
     // signed transaction is actually relayed, so the dispute must be
     // "submitted" here before the reconciler's own chain confirmation is
@@ -915,6 +924,8 @@ test("listOpenDisputes returns only bookings whose current lifecycle action is s
     assert.ok(dispute?.amount.amount);
     const nowSeconds = Math.floor(Date.now() / 1000);
     assert.ok(dispute?.openedAt !== null && dispute.openedAt <= nowSeconds && dispute.openedAt > nowSeconds - 60);
+    assert.equal(dispute?.note, "Client never showed up");
+    assert.equal(dispute?.evidenceHash, "a".repeat(64));
   } finally {
     closeDatabase(result);
   }
