@@ -272,6 +272,13 @@ const STATEMENTS: readonly string[] = [
     deployed_at INTEGER NOT NULL,
     PRIMARY KEY (booking_id, contract_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS escrow_events (
+    id TEXT PRIMARY KEY,
+    booking_id TEXT NOT NULL REFERENCES bookings(id),
+    wallet_address TEXT NOT NULL,
+    type TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
 ];
 
 /** `true` when `table` already has a column named `column` -- `PRAGMA
