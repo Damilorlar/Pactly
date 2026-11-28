@@ -48,7 +48,6 @@ import {
   workingRangesForSlots,
 } from "./availability.js";
 import { isWithinBookingWindow } from "./bookingWindow.js";
-import { isValidTimeZone } from "./timezone.js";
 
 /** Pactly's only supported asset for now (matches `services/booking.ts`'s
  * own `DEPOSIT_ASSET_SYMBOL`). Every amount this module returns is shaped
@@ -1275,7 +1274,6 @@ export async function listDiscoverProviders(
     );
   }
 
-  const weeklyPatternSlotsByProvider = new Map<string, number[]>();
   const cards = profiles.map((profile) => {
     const category = categoryById.get(profile.categoryId);
     if (!category) {
