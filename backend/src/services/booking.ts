@@ -103,7 +103,6 @@ import { recordEscrowDisputeResolution } from "../db/escrowDisputeResolutions.js
 import { listContractDeployments, recordContractDeployment } from "../db/escrowContractDeployments.js";
 import { escrowDisputeOpenings, bookings } from "../db/schema.js";
 import { getEscrowDisputeOpening, getEscrowDisputeOpeningsForBookings, recordEscrowDisputeOpening } from "../db/escrowDisputeOpenings.js";
-import { listContractDeployments } from "../db/escrowContractDeployments.js";
 import { getProviderProfileById, getProviderProfileByWallet } from "../db/providerProfiles.js";
 import { getReviewByBookingId, getReviewsForBookings, toReviewView, type ReviewView } from "../db/reviews.js";
 import { computeDepositAmount, NotAProviderError, ProviderNotFoundError } from "./profile.js";
@@ -1646,7 +1645,7 @@ export async function listOpenDisputes(db: Db): Promise<AdminDisputeListItem[]> 
         : { id: booking.providerProfileId, displayName: "", title: "" },
       clientWalletAddress: booking.clientWalletAddress,
       slotStartsAt: slot?.startsAt ?? null,
-      openedAt: opening?.openedAt ?? null,
+      openedAt: matchesCurrentContract ? opening.openedAt : null,
       pendingAction: derivePendingAction(booking, "disputed"),
     };
   });

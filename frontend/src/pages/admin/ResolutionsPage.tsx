@@ -111,7 +111,7 @@ function DisputeRow({
       <p className="booking-card__appointment">
         {dispute.slotStartsAt !== null ? `${formatSlotDay(dispute.slotStartsAt)} · ${formatSlotTime(dispute.slotStartsAt)}` : "No appointment time on record"}
       </p>
-<dl className="booking-card__amounts">
+      <dl className="booking-card__amounts">
         <div className="booking-card__amount-row">
           <dt>Deposit</dt>
           <dd className="tabular-nums">
@@ -128,7 +128,10 @@ function DisputeRow({
         </div>
       </dl>
       <p>
-        {dispute.slotStartsAt !== null ? `${formatSlotDay(dispute.slotStartsAt)} · ${formatSlotTime(dispute.slotStartsAt)}` : "No appointment time on record"}
+        <b>{REASON_LABEL[dispute.reason]}.</b>{" "}
+        {dispute.suggestedOutcome
+          ? `Policy suggestion: ${SUGGESTED_OUTCOME_LABEL[dispute.suggestedOutcome]}.`
+          : "The booking policy has no automatic suggestion for a plain disagreement."}
       </p>
       {resolvePending ? (
         <p className="booking-card__notice" aria-live="polite">
