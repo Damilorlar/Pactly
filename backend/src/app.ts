@@ -54,6 +54,8 @@ import { ensureAccountReady, ensureAccountReadyInBackground, type EnsureAccountR
 import { signXdrForWallet } from "./custodial/keys.js";
 import { getUserByWalletAddress } from "./db/users.js";
 import { getProviderProfileById } from "./db/providerProfiles.js";
+import { getSlotById } from "./db/availabilitySlots.js";
+import { listAdminDecisionAudit } from "./db/adminDecisionAudit.js";
 import { getCategoryById, getCategoryBySlug, insertCategory, updateCategoryVisibility } from "./db/categories.js";
 import { RateUnavailableError, getTryRate } from "./services/rate.js";
 import { UsdcTrustlineMissingError } from "./anchor/errors.js";
