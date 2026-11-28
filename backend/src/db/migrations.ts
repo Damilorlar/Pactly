@@ -87,6 +87,8 @@ const STATEMENTS: readonly string[] = [
     escrow_state TEXT,
     balance_state TEXT NOT NULL DEFAULT 'unpaid',
     escrow_contract_id TEXT,
+    escrow_reconciled_at INTEGER,
+    escrow_reconcile_attempted_at INTEGER,
     escrow_lock_claim_token TEXT,
     escrow_lock_claimed_at INTEGER,
     slot_id TEXT REFERENCES availability_slots(id),
@@ -264,6 +266,12 @@ const STATEMENTS: readonly string[] = [
     created_at INTEGER NOT NULL,
     UNIQUE (provider_profile_id, client_wallet_address, date)
   )`,
+  `CREATE TABLE IF NOT EXISTS escrow_contract_deployments (
+    booking_id TEXT NOT NULL REFERENCES bookings(id),
+    contract_id TEXT NOT NULL,
+    deployed_at INTEGER NOT NULL,
+    PRIMARY KEY (booking_id, contract_id)
+  )`,
 ];
 
 /** `true` when `table` already has a column named `column` -- `PRAGMA
@@ -295,6 +303,12 @@ export function runMigrations(sqlite: Database): void {
   }
   if (!hasColumn(sqlite, "bookings", "escrow_contract_id")) {
     sqlite.exec(`ALTER TABLE bookings ADD COLUMN escrow_contract_id TEXT`);
+  }
+  if (!hasColumn(sqlite, "bookings", "escrow_reconciled_at")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN escrow_reconciled_at INTEGER`);
+  }
+  if (!hasColumn(sqlite, "bookings", "escrow_reconcile_attempted_at")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN escrow_reconcile_attempted_at INTEGER`);
   }
   if (!hasColumn(sqlite, "provider_profiles", "display_name")) {
     sqlite.exec(`ALTER TABLE provider_profiles ADD COLUMN display_name TEXT NOT NULL DEFAULT ''`);
@@ -481,6 +495,18 @@ export function runMigrations(sqlite: Database): void {
   }
   if (!hasColumn(sqlite, "bookings", "provider_reminder_shown_at")) {
     sqlite.exec(`ALTER TABLE bookings ADD COLUMN provider_reminder_shown_at INTEGER`);
+  }
+  if (!hasColumn(sqlite, "bookings", "verified_session_counted_at")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN verified_session_counted_at INTEGER`);
+  }
+  if (!hasColumn(sqlite, "bookings", "provider_cancellation_counted_at")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN provider_cancellation_counted_at INTEGER`);
+  }
+  if (!hasColumn(sqlite, "bookings", "note")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN note TEXT`);
+  }
+  if (!hasColumn(sqlite, "bookings", "late_note")) {
+    sqlite.exec(`ALTER TABLE bookings ADD COLUMN late_note TEXT`);
   }
   // A shop can decline an unlocked hold on its own slot.
   if (!hasColumn(sqlite, "bookings", "declined_at")) {

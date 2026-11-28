@@ -251,6 +251,12 @@ export const bookings = sqliteTable("bookings", {
    * earlier deploy may already have landed and been funded.
    */
   escrowContractId: text("escrow_contract_id"),
+   /** UTC epoch seconds when the last chain read for this booking completed
+    * successfully. Failed reads never advance this timestamp. */
+   escrowReconciledAt: integer("escrow_reconciled_at"),
+   /** UTC epoch seconds of the most recent user-requested reconcile attempt,
+    * used to enforce the per-booking refresh interval across app instances. */
+   escrowReconcileAttemptedAt: integer("escrow_reconcile_attempted_at"),
   /**
    * Issue #6: the in-flight first-deploy claim's own token. `lockDeposit`
    * takes this claim with one conditioned `UPDATE` *before* it calls the
@@ -468,6 +474,10 @@ export const bookings = sqliteTable("bookings", {
    * never cleared. When null and appointment is within 24h, reminder is
    * shown to provider. */
   providerReminderShownAt: integer("provider_reminder_shown_at"),
+  /** Issue #77: a short late note (up to 140 chars) the shop sets on a
+   * locked booking. The client sees it on the booking; it never appears on
+   * the public profile. Clearing the note removes it. */
+  lateNote: text("late_note"),
 
   /** Story 3.8: private note left by the client on this booking (up to 500 chars). Visible on the booking detail page to the shop and the client, never on the public profile or discovery. */
   note: text("note"),
