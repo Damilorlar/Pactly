@@ -23,7 +23,7 @@ const REASON_LABEL: Record<AdminDisputeListItem["reason"], string> = {
 
 const OPENER_ROLE_LABEL: Record<"client" | "provider", string> = {
   client: "Opened by the client",
-  provider: "Opened by the provider",
+  provider: "Opened by the shop",
 };
 
 const SUGGESTED_OUTCOME_LABEL: Record<DisputeOutcome, string> = {
@@ -50,7 +50,22 @@ function DisputeRow({
 }) {
   const [busy, setBusy] = useState<DisputeOutcome | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [hashCopied, setHashCopied] = useState(false);
   const resolvePending = dispute.pendingAction === "resolve";
+
+  // Issue #131: an evidence hash is a stored value, never fetched or
+  // interpreted as a URL (even one shaped like "https://...") -- it is only
+  // ever shown as plain text here, with a copy button for convenience.
+  async function copyEvidenceHash(): Promise<void> {
+    if (!dispute.evidenceHash) return;
+    try {
+      await navigator.clipboard.writeText(dispute.evidenceHash);
+      setHashCopied(true);
+      setTimeout(() => setHashCopied(false), 1500);
+    } catch {
+      setHashCopied(false);
+    }
+  }
 
   async function resolve(outcome: DisputeOutcome): Promise<void> {
     setBusy(outcome);
@@ -122,16 +137,32 @@ function DisputeRow({
           <dt>{dispute.openedByRole ? OPENER_ROLE_LABEL[dispute.openedByRole] : "Opened by"}</dt>
           <dd className="tabular-nums">{dispute.openedByWallet ? shortenStellarId(dispute.openedByWallet) : "unknown"}</dd>
         </div>
+        <div className="booking-card__amount-row">
+          <dt>Opened</dt>
+          <dd className="tabular-nums">{dispute.openedAt ? formatSlotTime(dispute.openedAt) : "unknown"}</dd>
+        </div>
       </dl>
       <p>
         <b>{REASON_LABEL[dispute.reason]}.</b>{" "}
         {dispute.suggestedOutcome
           ? `Policy suggestion: ${SUGGESTED_OUTCOME_LABEL[dispute.suggestedOutcome]}.`
           : "The booking policy has no automatic suggestion for a plain disagreement."}
-        {dispute.evidenceHash ? (
-          <span className="evidence-hash">Evidence hash: {dispute.evidenceHash}</span>
-        ) : null}
       </p>
+      <div className="evidence-hash">
+        <span className="evidence-hash__label">Evidence hash</span>
+        {dispute.evidenceHash ? (
+          <>
+            <code className="evidence-hash__value" title={dispute.evidenceHash}>
+              {dispute.evidenceHash}
+            </code>
+            <button type="button" className="button-ghost" aria-label="Copy the evidence hash" onClick={() => void copyEvidenceHash()}>
+              {hashCopied ? "Copied" : "Copy"}
+            </button>
+          </>
+        ) : (
+          <span className="evidence-hash__unset">None on record</span>
+        )}
+      </div>
       {resolvePending ? (
         <p className="booking-card__notice" aria-live="polite">
           Waiting for the network to confirm.

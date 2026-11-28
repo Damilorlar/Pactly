@@ -475,6 +475,30 @@ export async function clearBookingNote(db: Db, id: string): Promise<boolean> {
   return result.changes > 0;
 }
 
+/** Issue #77: sets or clears the shop's late note on a locked booking.
+ * The note is up to 140 characters. An empty note clears the previous note.
+ * Throws if the booking does not exist, is not locked, or the note is too long. */
+export async function setLateNote(db: Db, id: string, note: string | null): Promise<void> {
+  const MAX_LATE_NOTE = 140;
+  if (note !== null && note.length > MAX_LATE_NOTE) {
+    throw new TypeError(`Late note must be ${MAX_LATE_NOTE} characters or fewer, got ${note.length} characters.`);
+  }
+  const booking = await getBookingById(db, id);
+  if (!booking) {
+    throw new TypeError(`No booking exists with id "${id}"`);
+  }
+  if (booking.escrowState !== "locked") {
+    throw new TypeError(`Late note can only be set on a locked booking, got escrowState "${booking.escrowState}".`);
+  }
+  const result = await db
+    .update(bookings)
+    .set({ lateNote: note ?? null })
+    .where(eq(bookings.id, id));
+  if (result.changes === 0) {
+    throw new TypeError(`No booking exists with id "${id}"`);
+  }
+}
+
 /** The backend's own write path for the balance side of AD-3. Touches
  * `balanceState` alone -- never `escrowState`. Throws if `id` matches no
  * row, rather than silently writing nothing. */
@@ -930,6 +954,47 @@ export async function getReconcilableBookings(db: Db): Promise<ReconcilableBooki
       ),
     );
   return rows.map((row) => ({ booking: row.booking, providerAddress: row.providerAddress }));
+}
+
+/** Returns a single booking with a persisted contract for an explicit
+ * reconcile request. Unlike the periodic batch query, this includes terminal
+ * states; `processEscrowRow` still refuses to regress them. */
+export async function getBookingForReconciliation(db: Db, bookingId: string): Promise<ReconcilableBooking | undefined> {
+  const rows = await db
+    .select({ booking: bookings, providerAddress: providerProfiles.walletAddress })
+    .from(bookings)
+    .innerJoin(providerProfiles, eq(bookings.providerProfileId, providerProfiles.id))
+    .where(and(eq(bookings.id, bookingId), isNotNull(bookings.escrowContractId)))
+    .limit(1);
+  const row = rows[0];
+  return row ? { booking: row.booking, providerAddress: row.providerAddress } : undefined;
+}
+
+/** Claims a caller-triggered reconcile. The conditional update is atomic,
+ * so concurrent requests and multiple app instances cannot exceed one
+ * attempt per booking in the 15-second window. */
+export function claimEscrowReconcileSync(db: DbOrTx, bookingId: string, now: number): boolean {
+  const result = db.run(sql`
+    UPDATE bookings
+    SET escrow_reconcile_attempted_at = ${now}
+    WHERE id = ${bookingId}
+      AND escrow_contract_id IS NOT NULL
+      AND (
+        escrow_reconcile_attempted_at IS NULL
+        OR escrow_reconcile_attempted_at <= ${now - 15}
+      )
+  `);
+  return result.changes > 0;
+}
+
+/** Marks the time a booking's chain read and reconciliation completed. */
+export function recordEscrowReconciledAtSync(db: DbOrTx, bookingId: string, contractId: string, now: number): void {
+  db.run(sql`
+    UPDATE bookings
+    SET escrow_reconciled_at = ${now}
+    WHERE id = ${bookingId}
+      AND escrow_contract_id = ${contractId}
+  `);
 }
 
 // ---------------------------------------------------------------------------
