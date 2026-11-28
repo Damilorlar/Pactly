@@ -23,7 +23,7 @@ const REASON_LABEL: Record<AdminDisputeListItem["reason"], string> = {
 
 const OPENER_ROLE_LABEL: Record<"client" | "provider", string> = {
   client: "Opened by the client",
-  provider: "Opened by the provider",
+  provider: "Opened by the shop",
 };
 
 const SUGGESTED_OUTCOME_LABEL: Record<DisputeOutcome, string> = {
@@ -121,6 +121,10 @@ function DisputeRow({
         <div className="booking-card__amount-row">
           <dt>{dispute.openedByRole ? OPENER_ROLE_LABEL[dispute.openedByRole] : "Opened by"}</dt>
           <dd className="tabular-nums">{dispute.openedByWallet ? shortenStellarId(dispute.openedByWallet) : "unknown"}</dd>
+        </div>
+        <div className="booking-card__amount-row">
+          <dt>Opened</dt>
+          <dd className="tabular-nums">{dispute.openedAt ? formatSlotTime(dispute.openedAt) : "unknown"}</dd>
         </div>
       </dl>
       <p>
