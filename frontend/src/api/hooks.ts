@@ -307,6 +307,11 @@ export function getBooking(bookingId: string, session: Session): Promise<Booking
   return apiGet<BookingView>(`/bookings/${bookingId}`, session.token);
 }
 
+/** Runs one chain reconcile for this booking and returns its updated view. */
+export function reconcileBooking(bookingId: string, session: Session): Promise<BookingView> {
+  return apiPost<BookingView>(`/bookings/${bookingId}/reconcile`, {}, session.token);
+}
+
 export function submitSignedTransaction(bookingId: string, signedXdr: string, session: Session): Promise<SubmitResponse> {
   return apiPost<SubmitResponse>(`/bookings/${bookingId}/submit`, { signedXdr }, session.token);
 }
@@ -535,6 +540,22 @@ export function markBalancePaidCash(bookingId: string, session: Session): Promis
 
 export function markBookingArrived(bookingId: string, session: Session): Promise<{ ok: true }> {
   return apiPost<{ ok: true }>(`/bookings/${bookingId}/arrived`, {}, session.token);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #77: shop late note on a locked booking.
+// ---------------------------------------------------------------------------
+
+export interface LateNoteResponse {
+  lateNote: string | null;
+}
+
+export function getLateNote(bookingId: string, session: Session): Promise<LateNoteResponse> {
+  return apiGet<LateNoteResponse>(`/bookings/${bookingId}/late-note`, session.token);
+}
+
+export function setLateNote(bookingId: string, lateNote: string | null, session: Session): Promise<{ ok: true }> {
+  return apiPost<{ ok: true }>(`/bookings/${bookingId}/late-note`, { lateNote }, session.token);
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +805,8 @@ export function useSavedShops(session: Session | undefined) {
     retry: false,
   });
 }
+
+// ---------------------------------------------------------------------------
 // Shop reports: clients report a shop to admins.
 // ---------------------------------------------------------------------------
 

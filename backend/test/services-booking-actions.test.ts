@@ -913,6 +913,7 @@ test("listOpenDisputes returns only bookings whose current lifecycle action is s
     assert.equal(dispute?.clientWalletAddress, openOne.clientWalletAddress);
     assert.equal(dispute?.provider.displayName, "Test Provider");
     assert.ok(dispute?.amount.amount);
+    assert.ok(dispute?.openedAt !== null && dispute.openedAt <= Date.now() && dispute.openedAt > Date.now() - 60_000);
   } finally {
     closeDatabase(result);
   }

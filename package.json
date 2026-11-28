@@ -2,6 +2,7 @@
   "name": "pactly",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Trust-backed booking marketplace with a Soroban escrow deposit.",
   "workspaces": [
     "backend",

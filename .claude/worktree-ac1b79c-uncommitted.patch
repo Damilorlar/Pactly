@@ -1,0 +1,1605 @@
+diff --git a/backend/src/anchor/errors.ts b/backend/src/anchor/errors.ts
+index 3cf7ae1..d50b82f 100644
+--- a/backend/src/anchor/errors.ts
++++ b/backend/src/anchor/errors.ts
+@@ -38,3 +38,49 @@ export class AnchorSignerMismatchError extends Error {
+     this.name = "AnchorSignerMismatchError";
+   }
+ }
++
++/**
++ * Story 2.4: the anchor's SEP-12 (KYC) exchange did not complete as
++ * expected -- unreachable, a non-OK response, or a body this backend cannot
++ * make sense of. The sandbox always auto-approves with no personal data, so
++ * this is never thrown on the happy path; it exists for a real anchor that
++ * genuinely refuses, or for the network itself failing. Never a raw anchor
++ * body -- the anchor's own `error` field, when present, is what this
++ * carries.
++ */
++export class AnchorKycError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "AnchorKycError";
++  }
++}
++
++/**
++ * Story 2.4: the anchor's SEP-6 deposit-side exchange (opening a deposit,
++ * polling its transaction, or the sandbox simulate call) did not complete --
++ * unreachable, a non-OK response, or a body missing what this backend needs.
++ * Carries the anchor's own reason where it supplied one, same discipline as
++ * {@link AnchorAuthError}.
++ */
++export class AnchorDepositError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "AnchorDepositError";
++  }
++}
++
++/**
++ * Story 2.4: the anchor (or a discovery step this story depends on, such as
++ * `stellar.toml` or the SEP-38 indicative price used for the limit check)
++ * could not be reached at all -- distinct from {@link AnchorAuthError}/
++ * {@link AnchorKycError}/{@link AnchorDepositError}, which all mean the
++ * anchor *answered*, just not successfully. The route maps this to the same
++ * "your deposit is untouched" shape every other unreachable-dependency error
++ * in this codebase uses.
++ */
++export class AnchorUnavailableError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "AnchorUnavailableError";
++  }
++}
+diff --git a/backend/src/anchor/sep10.ts b/backend/src/anchor/sep10.ts
+index 4aaf17b..458807e 100644
+--- a/backend/src/anchor/sep10.ts
++++ b/backend/src/anchor/sep10.ts
+@@ -235,3 +235,174 @@ export async function runAnchorSep10(
+ 
+   return { token: tokenBody.token, expiresAt: decodeJwtExpiryMs(tokenBody.token, homeDomain) };
+ }
++
++// ---------------------------------------------------------------------------
++// Story 2.4: a real wallet's own anchor session. `runAnchorSep10` above
++// requires a `Keypair` this backend can sign with, which is only ever true
++// for a managed account (a design question Story 2.1 explicitly left open
++// and deferred) -- never for a client's own wallet (this story's own
++// "Always" rule: "The client signs the anchor challenge in their own
++// wallet; Pactly never holds a key"). These two functions split the same
++// exchange into a request half (this backend only fetches and validates the
++// challenge) and a submit half (this backend only relays what the client's
++// own wallet already signed), so a route can hand the unsigned challenge to
++// the frontend and receive the signed one back, with no signer ever passing
++// through this backend. Deliberately not implemented by refactoring
++// `runAnchorSep10` into shared internals: that function is this session's
++// most heavily reviewed, security-critical code (Story 2.1's account-
++// identity-bypass and challenge-replay findings), so this story adds new,
++// separately-testable functions rather than touching it.
++// ---------------------------------------------------------------------------
++
++export interface RequestAnchorChallengeParams {
++  webAuthEndpoint: string;
++  /** From `stellar.toml`'s `SIGNING_KEY` -- confirms the returned challenge
++   * really came from the anchor before it is ever handed to a client wallet
++   * to sign. */
++  signingKey: string;
++  homeDomain: string;
++  networkPassphrase: string;
++  /** The wallet the challenge must be issued to. */
++  account: string;
++}
++
++export interface AnchorChallenge {
++  /** The unsigned challenge XDR -- handed to the client's own wallet to
++   * countersign; never signed by this backend. */
++  transaction: string;
++  networkPassphrase: string;
++}
++
++/**
++ * Fetches the anchor's SEP-10 challenge for `params.account` and confirms it
++ * actually came from the anchor and actually names that account -- the same
++ * two checks {@link runAnchorSep10} makes before ever signing anything --
++ * but returns the challenge unsigned instead of signing it, since this
++ * backend holds no key for a real wallet. Throws {@link AnchorAuthError} for
++ * anything that fails either check, or for a challenge naming a different
++ * account (mirrors the exact account-identity check Story 2.1's review found
++ * missing on the sign-and-submit side).
++ */
++export async function requestAnchorChallenge(
++  params: RequestAnchorChallengeParams,
++  fetchImpl: Sep10FetchLike = defaultFetch,
++): Promise<AnchorChallenge> {
++  const { webAuthEndpoint, signingKey, homeDomain, networkPassphrase, account } = params;
++
++  const challengeUrl = new URL(webAuthEndpoint);
++  challengeUrl.searchParams.set("account", account);
++
++  let challengeResponse: Pick<Response, "ok" | "status" | "json" | "text">;
++  try {
++    challengeResponse = await fetchImpl(challengeUrl.toString(), { method: "GET" });
++  } catch (cause) {
++    const reason = cause instanceof Error ? cause.message : String(cause);
++    throw new AnchorAuthError(`Could not reach ${homeDomain}'s SEP-10 endpoint: ${reason}`);
++  }
++  if (!challengeResponse.ok) {
++    const reason = await anchorReasonFromResponse(challengeResponse);
++    throw new AnchorAuthError(
++      `${homeDomain} refused the SEP-10 challenge request (HTTP ${challengeResponse.status})${reason ? `: ${reason}` : ""}`,
++    );
++  }
++  const challengeBody = (await readJson(challengeResponse, homeDomain)) as ChallengeResponseBody;
++  if (typeof challengeBody.transaction !== "string" || challengeBody.transaction.trim() === "") {
++    throw new AnchorAuthError(`${homeDomain}'s SEP-10 challenge response did not include a transaction`);
++  }
++  const responseNetworkPassphrase =
++    typeof challengeBody.network_passphrase === "string" ? challengeBody.network_passphrase : networkPassphrase;
++  if (responseNetworkPassphrase !== networkPassphrase) {
++    throw new AnchorAuthError(
++      `${homeDomain}'s SEP-10 challenge declared network_passphrase "${responseNetworkPassphrase}", expected "${networkPassphrase}"`,
++    );
++  }
++  const challengeXdr = challengeBody.transaction;
++
++  let clientAccountID: string;
++  try {
++    ({ clientAccountID } = WebAuth.readChallengeTx(challengeXdr, signingKey, networkPassphrase, homeDomain, challengeUrl.host));
++  } catch (cause) {
++    const reason = cause instanceof Error ? cause.message : String(cause);
++    throw new AnchorAuthError(`${homeDomain}'s SEP-10 challenge did not pass validation: ${reason}`);
++  }
++  if (clientAccountID !== account) {
++    throw new AnchorAuthError(
++      `${homeDomain}'s SEP-10 challenge names account "${clientAccountID}", but this exchange is for "${account}"`,
++    );
++  }
++
++  return { transaction: challengeXdr, networkPassphrase: responseNetworkPassphrase };
++}
++
++export interface SubmitAnchorChallengeParams {
++  webAuthEndpoint: string;
++  signingKey: string;
++  homeDomain: string;
++  networkPassphrase: string;
++  /** The wallet this signed challenge must belong to -- checked by
++   * re-deriving `clientAccountID` from the signed envelope itself (the same
++   * SDK reader, never trusting a caller-supplied value) before this backend
++   * ever relays anything to the anchor. */
++  expectedAccount: string;
++}
++
++/**
++ * Relays a client-wallet-signed anchor challenge and returns the anchor's
++ * JWT. Refuses (typed {@link AnchorAuthError}) before any network access if
++ * the signed envelope does not decode as a valid challenge from this
++ * anchor, does not carry `expectedAccount`'s own signature, or names a
++ * different account than `expectedAccount` -- the same signer-mismatch
++ * discipline `services/auth.ts`'s `getOrRefreshAnchorJwt` enforces for the
++ * managed-account path, applied here to a client-signed one instead.
++ */
++export async function submitAnchorChallenge(
++  params: SubmitAnchorChallengeParams,
++  signedTransactionXdr: string,
++  fetchImpl: Sep10FetchLike = defaultFetch,
++): Promise<AnchorSep10Result> {
++  const { webAuthEndpoint, signingKey, homeDomain, networkPassphrase, expectedAccount } = params;
++  const webAuthHost = new URL(webAuthEndpoint).host;
++
++  let clientAccountID: string;
++  try {
++    ({ clientAccountID } = WebAuth.readChallengeTx(signedTransactionXdr, signingKey, networkPassphrase, homeDomain, webAuthHost));
++  } catch (cause) {
++    const reason = cause instanceof Error ? cause.message : String(cause);
++    throw new AnchorAuthError(`This signed challenge did not pass validation: ${reason}`);
++  }
++  if (clientAccountID !== expectedAccount) {
++    throw new AnchorAuthError(
++      `This signed challenge names account "${clientAccountID}", but this exchange is for "${expectedAccount}"`,
++    );
++  }
++  try {
++    WebAuth.verifyChallengeTxSigners(signedTransactionXdr, signingKey, networkPassphrase, [clientAccountID], homeDomain, webAuthHost);
++  } catch (cause) {
++    const reason = cause instanceof Error ? cause.message : String(cause);
++    throw new AnchorAuthError(`This signed challenge is missing ${expectedAccount}'s own signature: ${reason}`);
++  }
++
++  let tokenResponse: Pick<Response, "ok" | "status" | "json" | "text">;
++  try {
++    tokenResponse = await fetchImpl(webAuthEndpoint, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ transaction: signedTransactionXdr }),
++    });
++  } catch (cause) {
++    const reason = cause instanceof Error ? cause.message : String(cause);
++    throw new AnchorAuthError(`Could not reach ${homeDomain}'s SEP-10 endpoint: ${reason}`);
++  }
++  if (!tokenResponse.ok) {
++    const reason = await anchorReasonFromResponse(tokenResponse);
++    throw new AnchorAuthError(
++      `${homeDomain} rejected the signed SEP-10 challenge (HTTP ${tokenResponse.status})${reason ? `: ${reason}` : ""}`,
++    );
++  }
++  const tokenBody = (await readJson(tokenResponse, homeDomain)) as TokenResponseBody;
++  if (typeof tokenBody.token !== "string" || tokenBody.token.trim() === "") {
++    throw new AnchorAuthError(`${homeDomain}'s SEP-10 response did not include a token`);
++  }
++
++  return { token: tokenBody.token, expiresAt: decodeJwtExpiryMs(tokenBody.token, homeDomain) };
++}
+diff --git a/backend/src/app.ts b/backend/src/app.ts
+index 22081ee..0a4407f 100644
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -19,6 +19,7 @@ import {
+   verifyPactlyChallenge,
+   verifyPactlyJwt,
+ } from "./auth/challenge.js";
++import { beginAnchorAuth, completeAnchorAuth, type AnchorAuthDeps } from "./services/auth.js";
+ import {
+   PactlyChallengeExpiredError,
+   PactlyChallengeInvalidError,
+@@ -42,6 +43,8 @@ import {
+   type DiscoverFilters,
+ } from "./services/profile.js";
+ import {
++  AnchorAmountOutOfRangeError,
++  AnchorSessionRequiredError,
+   BookingActionPendingError,
+   BalanceAlreadySettledError,
+   BookingEscrowStateError,
+@@ -49,6 +52,7 @@ import {
+   BookingNotFoundError,
+   InvalidDisputeReasonError,
+   NothingToPayError,
++  SANDBOX_ANCHOR_HOME_DOMAIN,
+   SlotTakenError,
+   SlotUnavailableError,
+   TooManyHoldsError,
+@@ -59,6 +63,7 @@ import {
+   fundDeposit,
+   getBookingForClient,
+   getBookingView,
++  getLocalDepositStatus,
+   holdSlot,
+   listBookingsForClient,
+   listBookingsForProvider,
+@@ -66,13 +71,18 @@ import {
+   lockDeposit,
+   markBalancePaidCash,
+   openDispute,
++  openLocalDeposit,
+   releaseDeposit,
+   resolveBookingDispute,
+   resolveSubmitRole,
++  simulateLocalDeposit,
+   submitBalancePayment,
+   submitSignedTransaction,
++  type AnchorLocalDepositDeps,
+   type BuildBalancePaymentDeps,
+ } from "./services/booking.js";
++import { AnchorDepositError, AnchorKycError, AnchorUnavailableError } from "./anchor/errors.js";
++import { AnchorKycFieldsRequiredError } from "./anchor/sep12.js";
+ import { EscrowApiError, EscrowConfigError, EscrowRequestError } from "./escrow/trustless-work/errors.js";
+ import { defaultEscrowAdapter } from "./escrow/trustless-work/client.js";
+ import type { EscrowAdapter } from "./escrow/interface.js";
+@@ -205,6 +215,18 @@ export interface CreateAppOptions {
+    * send/poll seam -- lets a test exercise `502 PAYMENT_FAILED`/
+    * `503 PAYMENT_UNAVAILABLE` without a real RPC endpoint. */
+   submitBalancePaymentDeps?: SubmitPaymentDeps;
++  /** Story 2.4: overrides the anchor's own SEP-10 challenge/verify network
++   * seams for `/bookings/:id/anchor/challenge` and `/anchor/verify` --
++   * defaults to the real network call, same discipline as every other
++   * `*Deps` option here. */
++  anchorAuthDeps?: AnchorAuthDeps;
++  /** Story 2.4: overrides every network seam `/bookings/:id/deposit/local`
++   * (open, poll, simulate) uses -- `stellar.toml` discovery, the anchor's
++   * own SEP-6/12/38 HTTP calls, the trustline check, and the change-trust
++   * transaction's own build/send seams. A test overriding every one of
++   * these never reaches `tr-mock-anchor.fly.dev` or a real Soroban RPC
++   * endpoint. */
++  anchorDepositDeps?: AnchorLocalDepositDeps;
+ }
+ 
+ export function createApp(db: Db, options: CreateAppOptions = {}): App {
+@@ -212,6 +234,8 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
+   const escrowAdapter = options.escrowAdapter ?? defaultEscrowAdapter;
+   const buildBalancePaymentDeps = options.buildBalancePaymentDeps ?? {};
+   const submitBalancePaymentDeps = options.submitBalancePaymentDeps ?? {};
++  const anchorAuthDeps = options.anchorAuthDeps ?? {};
++  const anchorDepositDeps = options.anchorDepositDeps ?? {};
+ 
+   // Every route above handles its own typed failures and returns the
+   // `{code, message}` envelope itself; this is only the backstop for a
+@@ -442,6 +466,177 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
+     }
+   });
+ 
++  // ---------------------------------------------------------------------
++  // Story 2.4: paying the deposit in local currency (SEP-6). Runs between
++  // `hold` and `lock` -- once the anchor's own transaction reaches
++  // `completed`, the client's wallet holds USDC and the existing
++  // lock/fund/submit flow above takes over unchanged. Every route resolves
++  // ownership the same way lock/fund/submit do (`getBookingForClient`),
++  // so an unknown or someone-else's booking gives the identical
++  // `404 BOOKING_NOT_FOUND`.
++  // ---------------------------------------------------------------------
++
++  /** Anchor-side errors translated into the route's own envelope -- shared
++   * by every Story 2.4 route below. Never a raw anchor body (AC5, same
++   * discipline as `escrowErrorResponse`). */
++  function anchorErrorResponse(error: unknown): { code: string; message: string; status: 401 | 502 | 503 } | undefined {
++    if (error instanceof AnchorSessionRequiredError) {
++      return { code: "ANCHOR_AUTH_REQUIRED", message: error.message, status: 401 };
++    }
++    if (error instanceof AnchorKycFieldsRequiredError) {
++      return { code: "ANCHOR_KYC_REQUIRED", message: error.message, status: 502 };
++    }
++    if (error instanceof AnchorKycError || error instanceof AnchorDepositError) {
++      return { code: "ANCHOR_REJECTED", message: "The anchor could not process this request. Your deposit is untouched.", status: 502 };
++    }
++    if (error instanceof AnchorUnavailableError) {
++      return { code: "ANCHOR_UNAVAILABLE", message: "The anchor is unavailable right now. Your deposit is untouched.", status: 503 };
++    }
++    return undefined;
++  }
++
++  /** Step one of the anchor's own SEP-10 sign-in for this booking's client
++   * wallet -- the client signs the returned challenge in their own wallet
++   * (this backend never holds that key) and posts it back to `/anchor/verify`. */
++  app.post("/bookings/:id/anchor/challenge", requirePactlyAuth, async (c) => {
++    const bookingId = c.req.param("id");
++    if (!bookingId) {
++      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
++    }
++    try {
++      const booking = await getBookingForClient(db, bookingId, c.get("walletAddress"));
++      const challenge = await beginAnchorAuth(booking.clientWalletAddress, anchorAuthDeps);
++      return c.json(challenge);
++    } catch (error) {
++      if (error instanceof BookingNotFoundError) {
++        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
++      }
++      const anchorResponse = anchorErrorResponse(error);
++      if (anchorResponse) {
++        return c.json({ code: anchorResponse.code, message: anchorResponse.message }, anchorResponse.status);
++      }
++      return c.json({ code: "ANCHOR_AUTH_FAILED", message: "The anchor could not verify this wallet. Try again." }, 401);
++    }
++  });
++
++  /** Step two: relays the client-wallet-signed challenge and caches the
++   * resulting anchor JWT (never returned to the client -- AD-5). */
++  app.post("/bookings/:id/anchor/verify", requirePactlyAuth, async (c) => {
++    const bookingId = c.req.param("id");
++    if (!bookingId) {
++      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
++    }
++    try {
++      const booking = await getBookingForClient(db, bookingId, c.get("walletAddress"));
++      const body = await c.req.json().catch(() => undefined);
++      const transaction = typeof body?.transaction === "string" ? body.transaction : undefined;
++      if (!transaction) {
++        return c.json({ code: "invalid_request", message: "transaction is required." }, 400);
++      }
++      await completeAnchorAuth(db, booking.clientWalletAddress, transaction, anchorAuthDeps);
++      return c.json({ ok: true });
++    } catch (error) {
++      if (error instanceof BookingNotFoundError) {
++        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
++      }
++      const anchorResponse = anchorErrorResponse(error);
++      if (anchorResponse) {
++        return c.json({ code: anchorResponse.code, message: anchorResponse.message }, anchorResponse.status);
++      }
++      return c.json({ code: "ANCHOR_AUTH_FAILED", message: "The anchor could not verify this signature. Try again." }, 401);
++    }
++  });
++
++  /** Opens (or returns the already-open, or retries after a `failed`) the
++   * local-currency deposit. A missing trustline short-circuits with
++   * `{needsTrustline: true, unsignedTrustlineXdr}`; posting the signed
++   * result back as `signedTrustlineXdr` continues the same open in one
++   * more call. */
++  app.post("/bookings/:id/deposit/local", requirePactlyAuth, async (c) => {
++    const bookingId = c.req.param("id");
++    if (!bookingId) {
++      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
++    }
++    try {
++      const body = await c.req.json().catch(() => undefined);
++      const signedTrustlineXdr = typeof body?.signedTrustlineXdr === "string" ? body.signedTrustlineXdr : undefined;
++      const result = await openLocalDeposit(db, bookingId, c.get("walletAddress"), signedTrustlineXdr, anchorDepositDeps);
++      return c.json(result);
++    } catch (error) {
++      if (error instanceof BookingNotFoundError) {
++        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
++      }
++      if (error instanceof BookingHoldExpiredError) {
++        return c.json({ code: "HOLD_EXPIRED", message: error.message }, 409);
++      }
++      if (error instanceof AnchorAmountOutOfRangeError) {
++        return c.json(
++          { code: "AMOUNT_OUT_OF_RANGE", message: error.message, details: { min: error.min, max: error.max, currency: error.currency } },
++          409,
++        );
++      }
++      const anchorResponse = anchorErrorResponse(error);
++      if (anchorResponse) {
++        return c.json({ code: anchorResponse.code, message: anchorResponse.message }, anchorResponse.status);
++      }
++      throw error;
++    }
++  });
++
++  /** Polls the local-currency deposit's current status. */
++  app.get("/bookings/:id/deposit/local", requirePactlyAuth, async (c) => {
++    const bookingId = c.req.param("id");
++    if (!bookingId) {
++      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
++    }
++    try {
++      const result = await getLocalDepositStatus(db, bookingId, c.get("walletAddress"), anchorDepositDeps);
++      return c.json(result);
++    } catch (error) {
++      if (error instanceof BookingNotFoundError) {
++        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
++      }
++      if (error instanceof BookingEscrowStateError) {
++        return c.json({ code: "DEPOSIT_NOT_FOUND", message: error.message }, 404);
++      }
++      const anchorResponse = anchorErrorResponse(error);
++      if (anchorResponse) {
++        return c.json({ code: anchorResponse.code, message: anchorResponse.message }, anchorResponse.status);
++      }
++      throw error;
++    }
++  });
++
++  /** The sandbox-only "Simulate the bank transfer" affordance -- `404` on
++   * any other anchor (spec's own "Always"/I-O-matrix rule), checked here,
++   * before the service layer, so a non-sandbox anchor never even attempts
++   * the call. */
++  app.post("/bookings/:id/deposit/local/simulate", requirePactlyAuth, async (c) => {
++    const bookingId = c.req.param("id");
++    if (!bookingId) {
++      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
++    }
++    if (config.anchorHomeDomain !== SANDBOX_ANCHOR_HOME_DOMAIN) {
++      return c.json({ code: "NOT_FOUND", message: "Not found." }, 404);
++    }
++    try {
++      await simulateLocalDeposit(db, bookingId, c.get("walletAddress"), anchorDepositDeps);
++      return c.json({ ok: true });
++    } catch (error) {
++      if (error instanceof BookingNotFoundError) {
++        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
++      }
++      if (error instanceof BookingEscrowStateError) {
++        return c.json({ code: "DEPOSIT_NOT_FOUND", message: error.message }, 404);
++      }
++      const anchorResponse = anchorErrorResponse(error);
++      if (anchorResponse) {
++        return c.json({ code: anchorResponse.code, message: anchorResponse.message }, anchorResponse.status);
++      }
++      throw error;
++    }
++  });
++
+   app.post("/bookings/:id/lock", requirePactlyAuth, async (c) => {
+     const bookingId = c.req.param("id");
+     if (!bookingId) {
+diff --git a/backend/src/db/bookings.ts b/backend/src/db/bookings.ts
+index 2f73b76..dfb3322 100644
+--- a/backend/src/db/bookings.ts
++++ b/backend/src/db/bookings.ts
+@@ -633,3 +633,83 @@ export async function listBookingRowsForProvider(db: Db, providerProfileId: stri
+     .where(eq(bookings.providerProfileId, providerProfileId));
+   return rows.map((row) => ({ booking: row.booking, slotStartsAt: row.slotStartsAt ?? null }));
+ }
++
++// ---------------------------------------------------------------------------
++// Story 2.4: the local-currency (SEP-6) deposit's own write path --
++// independent of the escrow columns above (AD-1: never touches
++// `escrow_state`). `services/booking.ts` composes these with the anchor
++// client calls; nothing outside this file builds SQL for them.
++// ---------------------------------------------------------------------------
++
++export interface AnchorDepositOpenedFields {
++  id: string;
++  status: string;
++  message?: string;
++  moreInfoUrl?: string;
++  reference?: string;
++  /** JSON-encoded snapshot of the anchor's own bank instructions. */
++  bankDetails?: string;
++  amountIn?: string;
++  currency?: string;
++}
++
++/** `openLocalDeposit`'s own write path: records the anchor's freshly opened
++ * SEP-6 deposit and, in the same write, extends the hold to
++ * `holdExpiresAt` -- the spec's own "Always" rule ("the booking's hold is
++ * extended while the deposit is pending"), applied the moment a deposit
++ * actually opens, not only on a later poll. */
++export async function recordAnchorDepositOpened(
++  db: Db,
++  id: string,
++  fields: AnchorDepositOpenedFields,
++  holdExpiresAt: number,
++  updatedAt: number,
++): Promise<void> {
++  const result = await db
++    .update(bookings)
++    .set({
++      anchorDepositId: fields.id,
++      anchorDepositStatus: fields.status,
++      anchorDepositMessage: fields.message ?? null,
++      anchorDepositMoreInfoUrl: fields.moreInfoUrl ?? null,
++      anchorDepositReference: fields.reference ?? null,
++      anchorDepositBankDetails: fields.bankDetails ?? null,
++      anchorDepositAmountIn: fields.amountIn ?? null,
++      anchorDepositCurrency: fields.currency ?? null,
++      anchorDepositUpdatedAt: updatedAt,
++      holdExpiresAt,
++    })
++    .where(eq(bookings.id, id));
++  if (result.changes === 0) {
++    throw new TypeError(`No booking exists with id "${id}"`);
++  }
++}
++
++/** A poll's own write path: refreshes the anchor's latest status/message for
++ * an already-open local deposit, extending the hold only when
++ * `holdExpiresAt` is supplied (the spec's own "Progress extends hold" row --
++ * the caller passes this only while the anchor still reports a pending
++ * status, never on `completed`/`error`, so a poll after the client has
++ * already moved on to Lock with Pactly never revives an otherwise-expired
++ * hold). */
++export async function updateAnchorDepositStatus(
++  db: Db,
++  id: string,
++  status: string,
++  message: string | undefined,
++  updatedAt: number,
++  holdExpiresAt?: number,
++): Promise<void> {
++  const result = await db
++    .update(bookings)
++    .set({
++      anchorDepositStatus: status,
++      anchorDepositMessage: message ?? null,
++      anchorDepositUpdatedAt: updatedAt,
++      ...(holdExpiresAt !== undefined ? { holdExpiresAt } : {}),
++    })
++    .where(eq(bookings.id, id));
++  if (result.changes === 0) {
++    throw new TypeError(`No booking exists with id "${id}"`);
++  }
++}
+diff --git a/backend/src/db/migrations.ts b/backend/src/db/migrations.ts
+index dad7a68..af7e328 100644
+--- a/backend/src/db/migrations.ts
++++ b/backend/src/db/migrations.ts
+@@ -77,6 +77,15 @@ const STATEMENTS: readonly string[] = [
+     escrow_deploy_tx_hash TEXT,
+     escrow_fund_tx_hash TEXT,
+     deploy_submitted_at INTEGER,
++    anchor_deposit_id TEXT,
++    anchor_deposit_status TEXT,
++    anchor_deposit_message TEXT,
++    anchor_deposit_more_info_url TEXT,
++    anchor_deposit_reference TEXT,
++    anchor_deposit_bank_details TEXT,
++    anchor_deposit_amount_in TEXT,
++    anchor_deposit_currency TEXT,
++    anchor_deposit_updated_at INTEGER,
+     created_at INTEGER NOT NULL
+   )`,
+   `CREATE TABLE IF NOT EXISTS reviews (
+@@ -273,4 +282,34 @@ export function runMigrations(sqlite: Database): void {
+   if (!hasColumn(sqlite, "bookings", "balance_payment_tx_hash")) {
+     sqlite.exec(`ALTER TABLE bookings ADD COLUMN balance_payment_tx_hash TEXT`);
+   }
++
++  // Story 2.4: the local-currency (SEP-6) deposit's own lifecycle columns --
++  // independent of the escrow columns above (this never writes escrow_state).
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_id")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_id TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_status")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_status TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_message")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_message TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_more_info_url")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_more_info_url TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_reference")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_reference TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_bank_details")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_bank_details TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_amount_in")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_amount_in TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_currency")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_currency TEXT`);
++  }
++  if (!hasColumn(sqlite, "bookings", "anchor_deposit_updated_at")) {
++    sqlite.exec(`ALTER TABLE bookings ADD COLUMN anchor_deposit_updated_at INTEGER`);
++  }
+ }
+diff --git a/backend/src/db/schema.ts b/backend/src/db/schema.ts
+index dbfd0da..0c50756 100644
+--- a/backend/src/db/schema.ts
++++ b/backend/src/db/schema.ts
+@@ -307,6 +307,41 @@ export const bookings = sqliteTable("bookings", {
+    * SUCCESS"). `null` for a booking whose balance is unpaid, or paid in
+    * cash (which has no transaction to point at). */
+   balancePaymentTxHash: text("balance_payment_tx_hash"),
++
++  /**
++   * Story 2.4: the local-currency (SEP-6) deposit's own lifecycle,
++   * independent of the escrow columns above -- this never touches
++   * `escrow_state` (AD-1 stays reconciler-only); it only tracks the
++   * anchor's own SEP-6 transaction until the client's wallet holds USDC,
++   * at which point the existing Lock with Pactly flow runs unchanged.
++   * `anchorDepositStatus` stores the anchor's own SEP-6 status word
++   * (`pending_user_transfer_start`, `pending_anchor`, `pending_trust`,
++   * `completed`, `error`) -- internal vocabulary only; every route maps it
++   * to the plain words NFR9 requires before it ever reaches the client.
++   */
++  anchorDepositId: text("anchor_deposit_id"),
++  anchorDepositStatus: text("anchor_deposit_status"),
++  /** The anchor's own latest human-readable status message (already plain
++   * English on this anchor, e.g. "Waiting for the TRY bank transfer.") --
++   * shown as-is, never a raw error body. */
++  anchorDepositMessage: text("anchor_deposit_message"),
++  anchorDepositMoreInfoUrl: text("anchor_deposit_more_info_url"),
++  /** The bank transfer's own reference (`external_transfer_memo`) the
++   * client must include so the anchor can match the incoming transfer. */
++  anchorDepositReference: text("anchor_deposit_reference"),
++  /** JSON-encoded snapshot of the anchor's own `instructions` (bank name,
++   * account number/IBAN, ...) at deposit-open time -- shown to the client
++   * as "Bank details" (NFR9), never re-fetched just to render the screen. */
++  anchorDepositBankDetails: text("anchor_deposit_bank_details"),
++  /** Decimal string (2dp, this anchor's own convention) in the anchor's
++   * off-chain currency -- never an AD-7 integer-smallest-unit string, since
++   * this amount is inherently fiat-decimal, not an on-chain asset amount. */
++  anchorDepositAmountIn: text("anchor_deposit_amount_in"),
++  /** The off-chain currency's own code (e.g. `"TRY"`), discovered from the
++   * anchor's SEP-38 info -- never hard-coded (AD-10). */
++  anchorDepositCurrency: text("anchor_deposit_currency"),
++  anchorDepositUpdatedAt: integer("anchor_deposit_updated_at"),
++
+   createdAt: integer("created_at").notNull(),
+ });
+ 
+diff --git a/backend/src/payments/stellar.ts b/backend/src/payments/stellar.ts
+index 4e667a9..81adbb8 100644
+--- a/backend/src/payments/stellar.ts
++++ b/backend/src/payments/stellar.ts
+@@ -240,3 +240,146 @@ export async function submitBalancePaymentTransaction(
+ 
+   return { txHash: sendResult.hash };
+ }
++
++// ---------------------------------------------------------------------------
++// Story 2.4: the missing-trustline check and the change-trust transaction
++// that follows it (Code Map: "how a classic transaction is built for the
++// client's signature; the change-trust transaction follows it"). A plain
++// classic operation, same as the balance payment above -- never routed
++// through `escrow/` (AD-3 is about the escrow contract specifically, but
++// the same "this is not Trustless Work's concern" reasoning applies).
++// ---------------------------------------------------------------------------
++
++/** The single network stage `hasUsdcTrustline` needs, so a test can assert
++ * both branches without a real RPC endpoint. Resolving means a trustline
++ * exists; rejecting means it does not -- the SDK's own `rpc.Server
++ * .getTrustline` conflates "no such ledger entry" with "could not read the
++ * ledger entry" into the same thrown error, so this seam (and this
++ * function) does too: a wallet the RPC endpoint cannot currently answer for
++ * is treated the same as one with no trustline yet, which only ever costs
++ * an extra, harmless change-trust prompt the client can sign or -- if the
++ * trustline actually is already there -- a no-op transaction. */
++export type GetTrustline = (publicKey: string, asset: Asset) => Promise<unknown>;
++
++function defaultGetTrustline(publicKey: string, asset: Asset): Promise<unknown> {
++  return new rpc.Server(config.sorobanRpcUrl).getTrustline(publicKey, asset);
++}
++
++export interface CheckTrustlineDeps {
++  getTrustline?: GetTrustline;
++}
++
++/** `true` once `publicKey` already trusts `assetCode`/`assetIssuer` -- the
++ * check `services/booking.ts` runs before ever opening a SEP-6 deposit
++ * (spec: "before opening the deposit, Pactly checks the wallet's
++ * trustline"). Never throws; see {@link GetTrustline}'s own comment for why
++ * an unreadable ledger entry and an absent one collapse to the same `false`. */
++export async function hasUsdcTrustline(
++  publicKey: string,
++  assetCode: string,
++  assetIssuer: string,
++  deps: CheckTrustlineDeps = {},
++): Promise<boolean> {
++  const getTrustline = deps.getTrustline ?? defaultGetTrustline;
++  try {
++    await getTrustline(publicKey, new Asset(assetCode, assetIssuer));
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++export interface BuildChangeTrustResult {
++  unsignedXdr: string;
++}
++
++/** Builds the unsigned change-trust transaction for `publicKey` to sign
++ * under the copy "Getting your wallet ready" (spec's own "Always" rule) --
++ * never signed here, exactly like every other unsigned-XDR builder in this
++ * codebase. Safe to build and sign even if a trustline already exists (a
++ * redundant `changeTrust` for an asset already trusted is a harmless
++ * no-op on Stellar), so this never needs its own submit-binding hash check
++ * the way a money-moving transaction does. */
++export async function buildChangeTrustTransaction(
++  publicKey: string,
++  assetCode: string,
++  assetIssuer: string,
++  deps: BuildPaymentDeps = {},
++): Promise<BuildChangeTrustResult> {
++  const getAccount = deps.getAccount ?? defaultGetAccount;
++  const account = await getAccount(publicKey);
++  const asset = new Asset(assetCode, assetIssuer);
++  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: config.stellarNetworkPassphrase })
++    .addOperation(Operation.changeTrust({ asset }))
++    .setTimeout(PAYMENT_TIMEOUT_SECONDS)
++    .build();
++  return { unsignedXdr: tx.toXDR() };
++}
++
++export interface SubmitChangeTrustResult {
++  txHash: string;
++}
++
++/** Relays a client-signed change-trust envelope and waits for a final
++ * ledger result -- mirrors {@link submitBalancePaymentTransaction}'s own
++ * send-then-poll shape (kept as its own small function rather than shared
++ * code: the two have different bodies to decode and this one has no
++ * submit-binding hash to check first). */
++export async function submitChangeTrustTransaction(
++  signedXdr: string,
++  deps: SubmitPaymentDeps = {},
++): Promise<SubmitChangeTrustResult> {
++  let server: rpc.Server | undefined;
++  const getServer = (): rpc.Server => {
++    server ??= new rpc.Server(config.sorobanRpcUrl);
++    return server;
++  };
++  const sendTransaction = deps.sendTransaction ?? ((tx) => getServer().sendTransaction(tx));
++  const waitForTransaction = deps.waitForTransaction ?? ((hash) => defaultWaitForTransaction(getServer(), hash));
++
++  let tx: Transaction;
++  try {
++    const parsed = TransactionBuilder.fromXDR(signedXdr, config.stellarNetworkPassphrase);
++    if (!(parsed instanceof Transaction)) {
++      throw new TypeError("not a plain transaction");
++    }
++    tx = parsed;
++  } catch {
++    throw new PaymentFailedError("This transaction could not be decoded as a change-trust transaction.");
++  }
++
++  let sendResult: rpc.Api.SendTransactionResponse;
++  try {
++    sendResult = await sendTransaction(tx);
++  } catch (error) {
++    throw new PaymentUnavailableError(
++      `Could not reach the Stellar network to submit the change-trust transaction: ${error instanceof Error ? error.message : String(error)}`,
++    );
++  }
++  if (sendResult.status === "TRY_AGAIN_LATER") {
++    throw new PaymentUnavailableError(`The Stellar network asked to retry the change-trust transaction later (status ${sendResult.status}).`);
++  }
++  if (sendResult.status !== "PENDING" && sendResult.status !== "DUPLICATE") {
++    throw new PaymentFailedError(`The change-trust transaction was rejected before submission (status ${sendResult.status}).`);
++  }
++
++  let finalResult: rpc.Api.GetTransactionResponse;
++  try {
++    finalResult = await waitForTransaction(sendResult.hash);
++  } catch (error) {
++    if (error instanceof PaymentFailedError || error instanceof PaymentUnavailableError) {
++      throw error;
++    }
++    throw new PaymentUnavailableError(
++      `Could not confirm the change-trust transaction on chain: ${error instanceof Error ? error.message : String(error)}`,
++    );
++  }
++  if (finalResult.status === rpc.Api.GetTransactionStatus.FAILED) {
++    throw new PaymentFailedError(`The change-trust transaction failed on submission (hash ${sendResult.hash}).`);
++  }
++  if (finalResult.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
++    throw new PaymentUnavailableError(`The change-trust transaction did not reach a final status in time (hash ${sendResult.hash}).`);
++  }
++
++  return { txHash: sendResult.hash };
++}
+diff --git a/backend/src/services/auth.ts b/backend/src/services/auth.ts
+index f87b377..84ff3c7 100644
+--- a/backend/src/services/auth.ts
++++ b/backend/src/services/auth.ts
+@@ -16,7 +16,7 @@ import type { Keypair } from "@stellar/stellar-sdk";
+ import { verifyPactlyJwt, type PactlyJwtOptions, type VerifiedPactlyJwt } from "../auth/challenge.js";
+ import { config } from "../config.js";
+ import { discoverAnchorSepEndpoints, type FetchLike } from "../anchor/stellar-toml.js";
+-import { runAnchorSep10, type Sep10FetchLike } from "../anchor/sep10.js";
++import { runAnchorSep10, requestAnchorChallenge, submitAnchorChallenge, type Sep10FetchLike, type AnchorChallenge } from "../anchor/sep10.js";
+ import { AnchorSignerMismatchError } from "../anchor/errors.js";
+ import { getAnchorJwt, upsertAnchorJwt } from "../db/anchorJwts.js";
+ import type { Db } from "../db/client.js";
+@@ -41,6 +41,27 @@ export interface GetOrRefreshAnchorJwtDeps {
+   sep10Fetch?: Sep10FetchLike;
+ }
+ 
++/**
++ * Story 2.4: the wallet-only anchor session's own read -- returns a still-
++ * fresh cached anchor JWT for `walletAddress`, or `undefined` if there is
++ * none or it has (near-)expired. Unlike {@link getOrRefreshAnchorJwt}
++ * below, this never runs the anchor's SEP-10 exchange itself (there is no
++ * signer here to run it with for a real wallet); a caller that gets
++ * `undefined` back must ask the client to complete
++ * `beginAnchorAuth`/`completeAnchorAuth` again.
++ */
++export async function getCachedAnchorJwt(
++  db: Db,
++  walletAddress: string,
++  now: () => number = () => Date.now(),
++): Promise<string | undefined> {
++  const cached = await getAnchorJwt(db, walletAddress);
++  if (cached && cached.expiresAt > now() + CACHE_FRESHNESS_MARGIN_MS) {
++    return cached.jwt;
++  }
++  return undefined;
++}
++
+ /**
+  * Returns a wallet's anchor JWT, reusing a still-valid cached one (no new
+  * anchor round trip) or running the anchor's real SEP-10 exchange and
+@@ -81,3 +102,62 @@ export async function getOrRefreshAnchorJwt(
+   await upsertAnchorJwt(db, { walletAddress, jwt: token, expiresAt, updatedAt: now() });
+   return token;
+ }
++
++// ---------------------------------------------------------------------------
++// Story 2.4: a real wallet's own anchor session -- the client signs the
++// anchor's SEP-10 challenge in their own wallet (this backend never holds
++// that key), so this is a two-step, two-request composition rather than the
++// single `getOrRefreshAnchorJwt` call above (which requires a `Keypair` this
++// backend can sign with -- true only for a managed account, Story 2.1's own
++// deferred design question, not this story's wallet-only path).
++// ---------------------------------------------------------------------------
++
++export interface AnchorAuthDeps {
++  tomlFetch?: FetchLike;
++  sep10Fetch?: Sep10FetchLike;
++}
++
++/** `POST /bookings/:id/anchor/challenge`'s own service call: discovers the
++ * anchor's endpoints and returns its SEP-10 challenge for `walletAddress`,
++ * unsigned -- the route hands this straight to the client's own wallet. */
++export async function beginAnchorAuth(walletAddress: string, deps: AnchorAuthDeps = {}): Promise<AnchorChallenge> {
++  const endpoints = await discoverAnchorSepEndpoints(config.anchorHomeDomain, deps.tomlFetch);
++  return requestAnchorChallenge(
++    {
++      webAuthEndpoint: endpoints.webAuthEndpoint,
++      signingKey: endpoints.signingKey,
++      homeDomain: config.anchorHomeDomain,
++      networkPassphrase: config.stellarNetworkPassphrase,
++      account: walletAddress,
++    },
++    deps.sep10Fetch,
++  );
++}
++
++/** `POST /bookings/:id/anchor/verify`'s own service call: relays the
++ * client-wallet-signed challenge and caches the resulting anchor JWT keyed
++ * by `walletAddress` -- the same cache (and the same reuse-until-expired
++ * behavior) {@link getOrRefreshAnchorJwt} reads, so Story 2.4's later
++ * SEP-12/SEP-6 calls for this wallet need no further anchor round trip
++ * until it actually expires. Never returns the anchor JWT itself (AD-5). */
++export async function completeAnchorAuth(
++  db: Db,
++  walletAddress: string,
++  signedTransactionXdr: string,
++  deps: AnchorAuthDeps = {},
++  now: () => number = () => Date.now(),
++): Promise<void> {
++  const endpoints = await discoverAnchorSepEndpoints(config.anchorHomeDomain, deps.tomlFetch);
++  const { token, expiresAt } = await submitAnchorChallenge(
++    {
++      webAuthEndpoint: endpoints.webAuthEndpoint,
++      signingKey: endpoints.signingKey,
++      homeDomain: config.anchorHomeDomain,
++      networkPassphrase: config.stellarNetworkPassphrase,
++      expectedAccount: walletAddress,
++    },
++    signedTransactionXdr,
++    deps.sep10Fetch,
++  );
++  await upsertAnchorJwt(db, { walletAddress, jwt: token, expiresAt, updatedAt: now() });
++}
+diff --git a/backend/src/services/booking.ts b/backend/src/services/booking.ts
+index 20ff5ef..904271a 100644
+--- a/backend/src/services/booking.ts
++++ b/backend/src/services/booking.ts
+@@ -83,10 +83,29 @@ import { resolveUsdcAsset, type ResolveUsdcAssetOptions, type UsdcAsset } from "
+ import {
+   buildBalancePaymentTransaction,
+   submitBalancePaymentTransaction,
++  hasUsdcTrustline,
++  buildChangeTrustTransaction,
++  submitChangeTrustTransaction,
++  smallestUnitToStellarAmount,
+   type BuildPaymentDeps,
+   type SubmitPaymentDeps,
++  type CheckTrustlineDeps,
+ } from "../payments/stellar.js";
+ import { PaymentUnavailableError } from "../payments/errors.js";
++import { discoverAnchorSepEndpoints, type FetchLike } from "../anchor/stellar-toml.js";
++import {
++  discoverLocalCurrencyAsset,
++  fetchAnchorIndicativeSellAmount,
++  fetchAnchorDepositInfo,
++  openAnchorDeposit,
++  fetchAnchorDepositTransaction,
++  simulateAnchorBankTransfer,
++  type AnchorFetchLike,
++} from "../anchor/sep6-deposit.js";
++import { ensureAnchorCustomerAccepted, type Sep12FetchLike } from "../anchor/sep12.js";
++import { AnchorDepositError, AnchorUnavailableError } from "../anchor/errors.js";
++import { getCachedAnchorJwt } from "./auth.js";
++import { recordAnchorDepositOpened, updateAnchorDepositStatus } from "../db/bookings.js";
+ import type { Db } from "../db/client.js";
+ import { BALANCE_STATES, type BalanceState, type DisputeOpenerRole, type DisputeOutcome, type DisputeReason } from "../db/schema.js";
+ 
+@@ -1834,3 +1853,415 @@ export async function listBookingsForProvider(
+   items.sort((a, b) => compareByAppointmentDate(a, b, now));
+   return items;
+ }
++
++// ---------------------------------------------------------------------------
++// Story 2.4: SEP-6 deposit (paying the deposit in local currency). Never
++// writes `escrow_state` (AD-1 stays reconciler-only) -- this only gets the
++// booking's own `depositAmount` in USDC into the client's wallet; once the
++// anchor reports the transfer `completed`, the existing Lock with Pactly
++// flow (`holdSlot` -> `lockDeposit` -> `fundDeposit`) takes over unchanged,
++// exactly as it does for a client who already held USDC.
++// ---------------------------------------------------------------------------
++
++/** The one sandbox anchor this hackathon's "Simulate the bank transfer"
++ * affordance is ever shown for (spec: "shown only when the resolved
++ * anchor's home domain is the sandbox one, and labelled as a sandbox
++ * action"). Exported so `app.ts`'s route can gate on the exact same value
++ * this module does, rather than a second copy of the literal drifting from
++ * this one. */
++export const SANDBOX_ANCHOR_HOME_DOMAIN = "tr-mock-anchor.fly.dev";
++
++/** A deposit outside the anchor's own advertised min/max, in its own local
++ * currency -- refused before any SEP-12/deposit-opening anchor call (spec's
++ * own "Always" rule; NFR3, 3.4 AC6). Carries the anchor's own limit and
++ * currency so the route's own `details.min/max/currency` (I/O matrix) needs
++ * no further lookup. */
++export class AnchorAmountOutOfRangeError extends Error {
++  constructor(
++    public readonly min: string | undefined,
++    public readonly max: string | undefined,
++    public readonly currency: string,
++  ) {
++    super(
++      min !== undefined && max !== undefined
++        ? `This deposit must be between ${min} and ${max} ${currency}.`
++        : min !== undefined
++          ? `This deposit must be at least ${min} ${currency}.`
++          : `This deposit must be at most ${max} ${currency}.`,
++    );
++    this.name = "AnchorAmountOutOfRangeError";
++  }
++}
++
++/** The client has not yet completed the anchor's own SEP-10 sign-in in
++ * their wallet (`services/auth.ts`'s `beginAnchorAuth`/`completeAnchorAuth`)
++ * -- refused before ever attempting SEP-12 or SEP-6, neither of which can
++ * run without the anchor's own JWT for this wallet. The route maps this to
++ * a `401` telling the client to sign the anchor's challenge first. */
++export class AnchorSessionRequiredError extends Error {
++  constructor(message = "Sign the anchor's verification request in your wallet first.") {
++    super(message);
++    this.name = "AnchorSessionRequiredError";
++  }
++}
++
++export interface AnchorLocalDepositDeps {
++  /** Injectable clock (UTC epoch seconds) -- defaults to the real one. */
++  now?: number;
++  resolveUsdcAsset?: (options?: ResolveUsdcAssetOptions) => Promise<UsdcAsset>;
++  /** Overrides `stellar.toml`'s fetch -- defaults to the real network call. */
++  tomlFetch?: FetchLike;
++  /** Overrides every anchor SEP-6/12/38 HTTP call this flow makes -- all
++   * three anchor client modules share the same `(url, init?) => Response`
++   * shape, so one seam covers `sep6-deposit.ts` and `sep12.ts` alike. */
++  anchorFetch?: AnchorFetchLike & Sep12FetchLike;
++  /** Overrides the trustline check -- defaults to the real Soroban RPC call. */
++  getTrustline?: CheckTrustlineDeps["getTrustline"];
++  /** Overrides how the client's account (and its sequence number) is loaded
++   * for the change-trust transaction -- defaults to the real Soroban RPC
++   * call, same seam `buildBalancePayment` already uses. */
++  getAccount?: BuildPaymentDeps["getAccount"];
++  /** Overrides the change-trust transaction's own send/poll seam. */
++  submitTrustline?: SubmitPaymentDeps;
++}
++
++interface AnchorContext {
++  transferServer: string;
++  quoteServer: string;
++  kycServer: string;
++}
++
++/** Discovers the three anchor endpoints this story's flows need. SEP-6/12/38
++ * are all optional fields on `anchor/stellar-toml.ts`'s own parser (only
++ * SEP-10's is required there, since Story 2.1 never needed the others) --
++ * refused here, typed {@link AnchorUnavailableError}, if any is missing. */
++async function requireAnchorContext(deps: AnchorLocalDepositDeps): Promise<AnchorContext> {
++  let endpoints;
++  try {
++    endpoints = await discoverAnchorSepEndpoints(config.anchorHomeDomain, deps.tomlFetch);
++  } catch (error) {
++    throw new AnchorUnavailableError(
++      `Could not discover ${config.anchorHomeDomain}'s SEP endpoints: ${error instanceof Error ? error.message : String(error)}`,
++    );
++  }
++  if (!endpoints.transferServer || !endpoints.kycServer || !endpoints.quoteServer) {
++    throw new AnchorUnavailableError(`${config.anchorHomeDomain}'s stellar.toml does not declare SEP-6/12/38 endpoints`);
++  }
++  return { transferServer: endpoints.transferServer, kycServer: endpoints.kycServer, quoteServer: endpoints.quoteServer };
++}
++
++/** The plain-word status NFR9 requires -- the anchor's own SEP-6 status
++ * word (`pending_user_transfer_start`, `pending_anchor`, `pending_trust`,
++ * `completed`, `error`) never reaches the client raw. */
++export type LocalDepositStatus = "awaiting_transfer" | "processing" | "received" | "failed";
++
++function mapAnchorStatus(status: string, anchorMessage: string | undefined): { status: LocalDepositStatus; message: string } {
++  switch (status) {
++    case "pending_user_transfer_start":
++      return { status: "awaiting_transfer", message: "Waiting for your transfer." };
++    case "pending_trust":
++      return { status: "awaiting_transfer", message: "Getting your wallet ready." };
++    case "pending_anchor":
++      return { status: "processing", message: "Money received. Sending your USDC." };
++    case "completed":
++      return { status: "received", message: "Money received." };
++    case "error":
++      return { status: "failed", message: anchorMessage ?? "Something went wrong with the transfer." };
++    default:
++      return { status: "processing", message: anchorMessage ?? "Processing your transfer." };
++  }
++}
++
++export interface LocalDepositBankDetails {
++  bankName?: string;
++  accountNumber?: string;
++}
++
++export interface LocalDepositView {
++  status: LocalDepositStatus;
++  message: string;
++  reference?: string;
++  bankDetails?: LocalDepositBankDetails;
++  /** Decimal string in the anchor's own local currency (never AD-7
++   * smallest-unit -- this is off-chain fiat, not an on-chain asset). */
++  amount?: { amount: string; currency: string };
++  moreInfoUrl?: string;
++  holdExpiresAt: number | null;
++  /** `true` only when a poll could not reach the anchor and this is the
++   * booking's own last-known status instead (I/O matrix: "Anchor
++   * unreachable: last known status plus stale: true"). */
++  stale?: true;
++  /** `true` alongside `unsignedTrustlineXdr` whenever the wallet still needs
++   * a USDC trustline -- at open time, or later if the anchor's own
++   * transaction reports `pending_trust` (spec: "handled the same way if it
++   * appears"). */
++  needsTrustline?: true;
++  unsignedTrustlineXdr?: string;
++}
++
++function parseBankDetails(json: string | null): LocalDepositBankDetails | undefined {
++  if (!json) return undefined;
++  try {
++    return JSON.parse(json) as LocalDepositBankDetails;
++  } catch {
++    return undefined;
++  }
++}
++
++function bankDetailsFromInstructions(instructions: Record<string, { value: string }>): LocalDepositBankDetails {
++  return {
++    bankName: instructions.bank_name?.value,
++    accountNumber: instructions.bank_account_number?.value,
++  };
++}
++
++/** Builds the response shape every branch below returns, from a booking's
++ * own currently-persisted anchor-deposit columns plus whatever this call's
++ * own fresher status/message/holdExpiresAt/trustline info is -- the one
++ * place that assembly happens, so the "open" and "poll" paths (and poll's
++ * own `pending_trust`/`stale` branches) can never drift into two different
++ * response shapes for the same stored data. */
++function buildLocalDepositView(
++  booking: BookingRow,
++  overrides: {
++    status: LocalDepositStatus;
++    message: string;
++    moreInfoUrl?: string;
++    holdExpiresAt: number | null;
++    stale?: true;
++    needsTrustline?: true;
++    unsignedTrustlineXdr?: string;
++  },
++): LocalDepositView {
++  return {
++    status: overrides.status,
++    message: overrides.message,
++    reference: booking.anchorDepositReference ?? undefined,
++    bankDetails: parseBankDetails(booking.anchorDepositBankDetails),
++    amount:
++      booking.anchorDepositAmountIn && booking.anchorDepositCurrency
++        ? { amount: booking.anchorDepositAmountIn, currency: booking.anchorDepositCurrency }
++        : undefined,
++    moreInfoUrl: overrides.moreInfoUrl ?? booking.anchorDepositMoreInfoUrl ?? undefined,
++    holdExpiresAt: overrides.holdExpiresAt,
++    ...(overrides.stale ? { stale: true as const } : {}),
++    ...(overrides.needsTrustline ? { needsTrustline: true as const, unsignedTrustlineXdr: overrides.unsignedTrustlineXdr } : {}),
++  };
++}
++
++/** Extends the hold the same {@link HOLD_DURATION_SECONDS} window every
++ * other extension in this file uses, from `now` -- the spec's own "Always"
++ * rule ("extended to now + 10 minutes on every poll that still shows
++ * progress"), applied the moment a deposit opens and on every poll that
++ * still shows progress. */
++function extendedHoldExpiresAt(now: number): number {
++  return now + HOLD_DURATION_SECONDS;
++}
++
++/** Builds the client's own unsigned change-trust transaction and wraps the
++ * result in the `needsTrustline` response shape -- shared by
++ * {@link openLocalDeposit} and {@link getLocalDepositStatus}'s own
++ * `pending_trust` branch. */
++async function buildNeedsTrustlineView(
++  booking: BookingRow,
++  usdc: UsdcAsset,
++  deps: AnchorLocalDepositDeps,
++  status: LocalDepositStatus,
++  message: string,
++  holdExpiresAt: number | null,
++): Promise<LocalDepositView> {
++  const built = await buildChangeTrustTransaction(booking.clientWalletAddress, usdc.code, usdc.issuer, { getAccount: deps.getAccount });
++  return buildLocalDepositView(booking, { status, message, holdExpiresAt, needsTrustline: true, unsignedTrustlineXdr: built.unsignedXdr });
++}
++
++/**
++ * `POST /bookings/:id/deposit/local`: opens (or returns the already-open, or
++ * retries after a `failed`) SEP-6 deposit for exactly this booking's own
++ * escrow `depositAmount`, converted to the anchor's own local currency via
++ * its SEP-38 indicative rate (this module's own small seam -- never an
++ * import of `anchor/sep38.ts`, Story 2.2's own module landing in parallel).
++ *
++ * Order matches the spec's own "Always" bullets: the limit check runs
++ * first (a read-only SEP-38/SEP-6-info lookup, refused with typed
++ * {@link AnchorAmountOutOfRangeError} before any SEP-12/deposit-opening
++ * call), then the trustline check (refused with `needsTrustline` if
++ * absent -- the caller re-calls this with `signedTrustlineXdr` once the
++ * client has signed the returned transaction, which this function submits
++ * and waits on before continuing in the very same call), then the anchor
++ * session check (typed {@link AnchorSessionRequiredError}), then SEP-12,
++ * then the SEP-6 deposit itself.
++ *
++ * Refused (typed {@link BookingHoldExpiredError}) once the hold has expired.
++ */
++export async function openLocalDeposit(
++  db: Db,
++  bookingId: string,
++  walletAddress: string,
++  signedTrustlineXdr: string | undefined,
++  deps: AnchorLocalDepositDeps = {},
++): Promise<LocalDepositView> {
++  const now = deps.now ?? Math.floor(Date.now() / 1000);
++  const booking = await getBookingForClient(db, bookingId, walletAddress);
++  requireHoldNotExpired(booking, now);
++
++  if (booking.anchorDepositId && booking.anchorDepositStatus !== "error") {
++    return buildLocalDepositView(booking, {
++      status: mapAnchorStatus(booking.anchorDepositStatus ?? "pending_user_transfer_start", booking.anchorDepositMessage ?? undefined).status,
++      message: booking.anchorDepositMessage ?? mapAnchorStatus(booking.anchorDepositStatus ?? "pending_user_transfer_start", undefined).message,
++      holdExpiresAt: booking.holdExpiresAt,
++    });
++  }
++
++  const usdc = await (deps.resolveUsdcAsset ?? resolveUsdcAsset)();
++  const usdcDecimal = smallestUnitToStellarAmount(booking.depositAmount);
++  const context = await requireAnchorContext(deps);
++
++  const localAsset = await discoverLocalCurrencyAsset(context.quoteServer, deps.anchorFetch);
++  const buyAsset = `stellar:${usdc.code}:${usdc.issuer}`;
++  const localAmount = await fetchAnchorIndicativeSellAmount(context.quoteServer, localAsset, buyAsset, usdcDecimal, deps.anchorFetch);
++  const currency = localAsset.replace(/^iso4217:/, "");
++
++  const info = await fetchAnchorDepositInfo(context.transferServer, usdc.code, deps.anchorFetch);
++  const belowMin = info.minAmount !== undefined && Number(localAmount) < Number(info.minAmount);
++  const aboveMax = info.maxAmount !== undefined && Number(localAmount) > Number(info.maxAmount);
++  if (belowMin || aboveMax) {
++    throw new AnchorAmountOutOfRangeError(info.minAmount, info.maxAmount, currency);
++  }
++
++  if (signedTrustlineXdr) {
++    await submitChangeTrustTransaction(signedTrustlineXdr, deps.submitTrustline ?? {});
++  }
++  const hasTrustline = await hasUsdcTrustline(booking.clientWalletAddress, usdc.code, usdc.issuer, { getTrustline: deps.getTrustline });
++  if (!hasTrustline) {
++    return buildNeedsTrustlineView(booking, usdc, deps, "awaiting_transfer", "Getting your wallet ready.", booking.holdExpiresAt);
++  }
++
++  const jwt = await getCachedAnchorJwt(db, booking.clientWalletAddress);
++  if (!jwt) {
++    throw new AnchorSessionRequiredError();
++  }
++
++  await ensureAnchorCustomerAccepted(context.kycServer, jwt, booking.clientWalletAddress, deps.anchorFetch);
++
++  const fundingMethod = info.fundingMethods[0];
++  if (!fundingMethod) {
++    throw new AnchorDepositError("The anchor did not advertise any way to fund a deposit.");
++  }
++
++  const opened = await openAnchorDeposit(
++    { transferServer: context.transferServer, jwt, assetCode: usdc.code, account: booking.clientWalletAddress, amount: localAmount, fundingMethod },
++    deps.anchorFetch,
++  );
++
++  const bankDetails = bankDetailsFromInstructions(opened.instructions);
++  const reference = opened.instructions.external_transfer_memo?.value;
++  const holdExpiresAt = extendedHoldExpiresAt(now);
++  await recordAnchorDepositOpened(
++    db,
++    bookingId,
++    {
++      id: opened.id,
++      status: "pending_user_transfer_start",
++      moreInfoUrl: opened.moreInfoUrl,
++      reference,
++      bankDetails: JSON.stringify(bankDetails),
++      amountIn: localAmount,
++      currency,
++    },
++    holdExpiresAt,
++    Date.now(),
++  );
++
++  return {
++    status: "awaiting_transfer",
++    message: "Waiting for your transfer.",
++    reference,
++    bankDetails,
++    amount: { amount: localAmount, currency },
++    moreInfoUrl: opened.moreInfoUrl,
++    holdExpiresAt,
++  };
++}
++
++/**
++ * `GET /bookings/:id/deposit/local`: the current status of an already-open
++ * local deposit, mapped to plain words (NFR9). Extends the hold on every
++ * poll that still shows progress (`pending_user_transfer_start`,
++ * `pending_anchor`, `pending_trust`); a `pending_trust` result also carries
++ * a fresh unsigned change-trust transaction, same as {@link openLocalDeposit}
++ * itself (spec: "handled the same way if it appears"). Falls back to the
++ * booking's own last-known status with `stale: true` if the anchor cannot
++ * be reached (typed {@link AnchorUnavailableError} from the client modules
++ * below), rather than failing the poll outright.
++ *
++ * Refused (typed {@link BookingEscrowStateError}) if no local deposit has
++ * ever been opened for this booking.
++ */
++export async function getLocalDepositStatus(
++  db: Db,
++  bookingId: string,
++  walletAddress: string,
++  deps: AnchorLocalDepositDeps = {},
++): Promise<LocalDepositView> {
++  const now = deps.now ?? Math.floor(Date.now() / 1000);
++  const booking = await getBookingForClient(db, bookingId, walletAddress);
++  if (!booking.anchorDepositId) {
++    throw new BookingEscrowStateError(`Booking "${bookingId}" has no local-currency deposit open yet; open one first`);
++  }
++
++  const context = await requireAnchorContext(deps);
++  const jwt = await getCachedAnchorJwt(db, booking.clientWalletAddress);
++  if (!jwt) {
++    throw new AnchorSessionRequiredError();
++  }
++
++  let tx;
++  try {
++    tx = await fetchAnchorDepositTransaction(context.transferServer, jwt, booking.anchorDepositId, deps.anchorFetch);
++  } catch (error) {
++    if (error instanceof AnchorUnavailableError) {
++      return buildLocalDepositView(booking, {
++        status: mapAnchorStatus(booking.anchorDepositStatus ?? "pending_user_transfer_start", booking.anchorDepositMessage ?? undefined).status,
++        message: booking.anchorDepositMessage ?? "Waiting for your transfer.",
++        holdExpiresAt: booking.holdExpiresAt,
++        stale: true,
++      });
++    }
++    throw error;
++  }
++
++  const mapped = mapAnchorStatus(tx.status, tx.message);
++  const stillPending = tx.status === "pending_user_transfer_start" || tx.status === "pending_anchor" || tx.status === "pending_trust";
++  const holdExpiresAt = stillPending ? extendedHoldExpiresAt(now) : booking.holdExpiresAt;
++  await updateAnchorDepositStatus(db, bookingId, tx.status, tx.message, Date.now(), stillPending ? holdExpiresAt ?? undefined : undefined);
++
++  if (tx.status === "pending_trust") {
++    const usdc = await (deps.resolveUsdcAsset ?? resolveUsdcAsset)();
++    return buildNeedsTrustlineView(booking, usdc, deps, mapped.status, mapped.message, holdExpiresAt);
++  }
++
++  return buildLocalDepositView(booking, { status: mapped.status, message: mapped.message, moreInfoUrl: tx.moreInfoUrl, holdExpiresAt });
++}
++
++/**
++ * `POST /bookings/:id/deposit/local/simulate`: the sandbox-only "Simulate
++ * the bank transfer" affordance. The route itself gates this to
++ * {@link SANDBOX_ANCHOR_HOME_DOMAIN} (spec: "On a non-sandbox anchor: 404")
++ * -- this function assumes that check already passed and simply relays the
++ * booking's own last-recorded local-currency amount to the anchor's own
++ * simulate endpoint. Refused (typed {@link BookingEscrowStateError}) if no
++ * local deposit has ever been opened for this booking.
++ */
++export async function simulateLocalDeposit(
++  db: Db,
++  bookingId: string,
++  walletAddress: string,
++  deps: AnchorLocalDepositDeps = {},
++): Promise<void> {
++  const booking = await getBookingForClient(db, bookingId, walletAddress);
++  if (!booking.anchorDepositId || !booking.anchorDepositAmountIn) {
++    throw new BookingEscrowStateError(`Booking "${bookingId}" has no local-currency deposit open yet; open one first`);
++  }
++  const context = await requireAnchorContext(deps);
++  await simulateAnchorBankTransfer(context.transferServer, booking.anchorDepositId, booking.anchorDepositAmountIn, deps.anchorFetch);
++}
+diff --git a/frontend/src/api/hooks.ts b/frontend/src/api/hooks.ts
+index b345372..92a6e71 100644
+--- a/frontend/src/api/hooks.ts
++++ b/frontend/src/api/hooks.ts
+@@ -6,6 +6,7 @@ import { apiGet, apiPost, apiPut, ApiError } from "./client";
+ import type {
+   ActionResponse,
+   AdminDisputesResponse,
++  AnchorChallengeResponse,
+   BalancePaymentBuildResponse,
+   BalancePaymentSubmitResponse,
+   BookingView,
+@@ -15,6 +16,7 @@ import type {
+   DisputeReason,
+   FundResponse,
+   HoldSlotResponse,
++  LocalDepositView,
+   LockResponse,
+   MyBookingsResponse,
+   OpenDisputeResponse,
+@@ -183,6 +185,60 @@ export function submitSignedTransaction(bookingId: string, signedXdr: string, se
+   return apiPost<SubmitResponse>(`/bookings/${bookingId}/submit`, { signedXdr }, session.token);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Story 2.4: paying the deposit in local currency (SEP-6). Same imperative-
++// function shape as lock/fund/submit above -- `BookingPage.tsx` drives the
++// anchor sign-in and the deposit-open call the same way, each waiting on a
++// wallet signature (or a poll) before the next step.
++// ---------------------------------------------------------------------------
++
++/** Step one of the anchor's own sign-in for this booking's wallet -- the
++ * returned transaction is signed in the client's own wallet
++ * (`wallet/index.ts`'s `signXdr`), never by this backend. */
++export function beginAnchorAuth(bookingId: string, session: Session): Promise<AnchorChallengeResponse> {
++  return apiPost<AnchorChallengeResponse>(`/bookings/${bookingId}/anchor/challenge`, {}, session.token);
++}
++
++/** Step two: relays the signed challenge. The anchor's own JWT never
++ * reaches this response (AD-5) -- only `{ok: true}`. */
++export function completeAnchorAuth(bookingId: string, signedTransaction: string, session: Session): Promise<{ ok: true }> {
++  return apiPost<{ ok: true }>(`/bookings/${bookingId}/anchor/verify`, { transaction: signedTransaction }, session.token);
++}
++
++/** Opens (or continues) the local-currency deposit. Pass `signedTrustlineXdr`
++ * once the client has signed a `needsTrustline` response's own transaction,
++ * to continue the same open in one more call. */
++export function openLocalDeposit(bookingId: string, session: Session, signedTrustlineXdr?: string): Promise<LocalDepositView> {
++  return apiPost<LocalDepositView>(`/bookings/${bookingId}/deposit/local`, signedTrustlineXdr ? { signedTrustlineXdr } : {}, session.token);
++}
++
++/** Polls the local-currency deposit's own status -- the screen advances on
++ * its own; the client never refreshes (EXPERIENCE.md: "Waiting on a
++ * local-currency payment"). Stops polling once a terminal status
++ * (`received`/`failed`) is reached, or the last attempt errored. */
++const LOCAL_DEPOSIT_POLL_INTERVAL_MS = 4000;
++
++export function useLocalDepositStatus(bookingId: string | undefined, session: Session | undefined, options: { enabled?: boolean } = {}) {
++  return useQuery({
++    queryKey: ["bookings", bookingId, "deposit", "local"],
++    queryFn: () => apiGet<LocalDepositView>(`/bookings/${bookingId}/deposit/local`, session?.token),
++    enabled: Boolean(bookingId && session) && (options.enabled ?? true),
++    retry: false,
++    refetchInterval: (query) => {
++      const status = query.state.data?.status;
++      if (query.state.error || status === "received" || status === "failed") return false;
++      return LOCAL_DEPOSIT_POLL_INTERVAL_MS;
++    },
++  });
++}
++
++/** The sandbox-only "Simulate the bank transfer" affordance -- the backend
++ * itself refuses this with a `404` off the sandbox anchor, so the screen
++ * only needs to call it, never decide when it applies. */
++export function simulateLocalDeposit(bookingId: string, session: Session): Promise<{ ok: true }> {
++  return apiPost<{ ok: true }>(`/bookings/${bookingId}/deposit/local/simulate`, {}, session.token);
++}
++
+ function sleep(ms: number): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, ms));
+ }
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index 84d62b5..d9f26ca 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -140,6 +140,48 @@ export interface SubmitResponse {
+   txHash: string;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Story 2.4: paying the deposit in local currency (SEP-6). Mirrors
++// `backend/src/services/booking.ts`'s own response shapes exactly, same
++// discipline as the rest of this file. No SEP vocabulary anywhere here
++// (NFR9) -- the anchor's own status word never reaches this file at all.
++// ---------------------------------------------------------------------------
++
++/** `POST /bookings/:id/anchor/challenge`'s response -- the anchor's own
++ * unsigned SEP-10 challenge XDR, signed in the client's own wallet and
++ * posted back to `/anchor/verify`. Never anything crypto-flavored beyond
++ * the transaction itself reaching this file; the screen's own copy never
++ * says "SEP-10" or "challenge". */
++export interface AnchorChallengeResponse {
++  transaction: string;
++}
++
++export type LocalDepositStatus = "awaiting_transfer" | "processing" | "received" | "failed";
++
++export interface LocalDepositBankDetails {
++  bankName?: string;
++  accountNumber?: string;
++}
++
++/** `POST`/`GET /bookings/:id/deposit/local`'s shared response shape. A
++ * `needsTrustline` response carries its own `unsignedTrustlineXdr` to sign
++ * under the copy "Getting your wallet ready" -- the client never sees the
++ * word "trustline". */
++export interface LocalDepositView {
++  status: LocalDepositStatus;
++  message: string;
++  reference?: string;
++  bankDetails?: LocalDepositBankDetails;
++  /** Decimal string in the anchor's own local currency -- never an AD-7
++   * smallest-unit string (this is off-chain fiat, not an on-chain asset). */
++  amount?: { amount: string; currency: string };
++  moreInfoUrl?: string;
++  holdExpiresAt: number | null;
++  stale?: true;
++  needsTrustline?: true;
++  unsignedTrustlineXdr?: string;
++}
++
+ export type EscrowLifecycleAction = "funded" | "completed" | "approved" | "disputed" | "released" | "resolved";
+ 
+ /** Story 3.6 (review round): which action kind this booking has a signed
+diff --git a/frontend/src/pages/booking/BookingPage.tsx b/frontend/src/pages/booking/BookingPage.tsx
+index 2a72c7c..0d1bfeb 100644
+--- a/frontend/src/pages/booking/BookingPage.tsx
++++ b/frontend/src/pages/booking/BookingPage.tsx
+@@ -2,21 +2,27 @@ import { useEffect, useMemo, useRef, useState } from "react";
+ import { Link, useParams, useSearchParams } from "react-router";
+ 
+ import {
++  beginAnchorAuth,
++  completeAnchorAuth,
+   fundDepositWithRetry,
+   lockDeposit,
++  openLocalDeposit,
++  simulateLocalDeposit,
+   submitSignedTransaction,
+   useBooking,
+   useHoldSlot,
++  useLocalDepositStatus,
+   usePublicProviderProfile,
+ } from "../../api/hooks";
+ import { ApiError } from "../../api/client";
+-import type { HoldSlotResponse } from "../../api/types";
++import type { HoldSlotResponse, LocalDepositView } from "../../api/types";
+ import { DepositPill } from "../../components/DepositPill";
+ import { EscrowLane } from "../../components/EscrowLane";
++import { LocalDepositPanel } from "../../components/LocalDepositPanel";
+ import { LockButton } from "../../components/LockButton";
+ import { ProviderHeader } from "../../components/ProviderHeader";
+ import { Seal } from "../../components/Seal";
+-import { LOCAL_CURRENCY_UNAVAILABLE_NOTE, formatMoney } from "../../lib/money";
++import { formatMoney } from "../../lib/money";
+ import { formatSlotDay, formatSlotTime } from "../../lib/time";
+ import { getSession, signIn, signOut, signXdr, type Session } from "../../wallet";
+ 
+@@ -44,6 +50,25 @@ interface PendingSignature {
+   kind: "deploy" | "fund";
+ }
+ 
++/**
++ * Story 2.4: the local-currency (SEP-6) payment's own small state machine,
++ * parallel to `DisplayPhase` above -- it only ever runs *before* the
++ * existing Lock with Pactly flow, and hands off to it (via `readyToLock`
++ * below) the moment the anchor reports the transfer `received`, at which
++ * point the client's wallet holds USDC and the rest of the screen behaves
++ * exactly as the wallet-payment path always has.
++ */
++type LocalPaymentPhase =
++  | "not_started"
++  | "anchor_signing"
++  | "opening"
++  | "trustline_signing"
++  | "trustline_submitting"
++  | "awaiting_transfer"
++  | "processing"
++  | "received"
++  | "failed";
++
+ interface FlowEngineState {
+   contractId?: string;
+   /** `undefined` until a signed deploy matching this contract has actually
+@@ -98,6 +123,21 @@ export function BookingPage() {
+   const [flowFatalError, setFlowFatalError] = useState<string | undefined>();
+   const [needsSignIn, setNeedsSignIn] = useState(false);
+ 
++  // Story 2.4: paying the deposit in local currency. `paymentMethod` picks
++  // which of the two live options drives the escrow lane; "Lock with
++  // Pactly" itself (below) only ever runs once either the client chose the
++  // wallet directly, or the local flow reaches "received".
++  const [paymentMethod, setPaymentMethod] = useState<"wallet" | "local">("wallet");
++  const [localPhase, setLocalPhase] = useState<LocalPaymentPhase>("not_started");
++  const [localDeposit, setLocalDeposit] = useState<LocalDepositView | undefined>();
++  const [localError, setLocalError] = useState<string | undefined>();
++  const [simulateAvailable, setSimulateAvailable] = useState(true);
++  const localInFlightRef = useRef(false);
++
++  const localDepositQuery = useLocalDepositStatus(hold?.bookingId, session, {
++    enabled: paymentMethod === "local" && (localPhase === "awaiting_transfer" || localPhase === "processing"),
++  });
++
+   // Review follow-up: the flow's own "engine" state (which contractId is in
+   // play, whether a deploy has actually been submitted) lives in a ref, not
+   // in React state read through a closure -- `runLockFlow` and
